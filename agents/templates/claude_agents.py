@@ -5,10 +5,11 @@ import textwrap
 from typing import Any, Optional
 
 from arcengine import FrameData, GameAction, GameState
-from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ToolUseBlock
+from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ToolUseBlock, ResultMessage
 
 from ..agent import Agent
 from ..claude_tools import create_arc_tools_server
+from ..claude_recorder import ClaudeCodeRecorder
 
 logger = logging.getLogger()
 
@@ -21,6 +22,10 @@ class ClaudeCodeAgent(Agent):
     step_counter: int
     mcp_server: Any
     latest_reasoning: str
+    claude_recorder: Optional[ClaudeCodeRecorder]
+    captured_messages: list[Any]
+    current_prompt: str
+    result_message: Optional[Any]
     
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -28,6 +33,17 @@ class ClaudeCodeAgent(Agent):
         self.step_counter = 0
         self.latest_reasoning = ""
         self.mcp_server = create_arc_tools_server(self)
+        self.captured_messages = []
+        self.current_prompt = ""
+        self.result_message = None
+        
+        if kwargs.get("record", False):
+            self.claude_recorder = ClaudeCodeRecorder(
+                game_id=kwargs.get("game_id", "unknown"),
+                agent_name=self.agent_name
+            )
+        else:
+            self.claude_recorder = None
         
         logging.getLogger("anthropic").setLevel(logging.CRITICAL)
         logging.getLogger("httpx").setLevel(logging.CRITICAL)
@@ -97,6 +113,9 @@ class ClaudeCodeAgent(Agent):
         
         self.latest_reasoning = ""
         action_taken: Optional[GameAction] = None
+        self.captured_messages = []
+        self.current_prompt = self.build_game_prompt(latest_frame)
+        self.result_message = None
         
         try:
             import asyncio
@@ -119,6 +138,11 @@ class ClaudeCodeAgent(Agent):
                     permission_mode="bypassPermissions",
                 )
             ):
+                self.captured_messages.append(message)
+                
+                if isinstance(message, ResultMessage):
+                    self.result_message = message
+                
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if hasattr(block, "text") and block.text:
@@ -144,6 +168,25 @@ class ClaudeCodeAgent(Agent):
         loop.run_until_complete(run_query())
         
         if action_taken:
+            if self.claude_recorder and not self.is_playback:
+                parsed_action = {
+                    "action": action_taken.value,
+                    "reasoning": self.latest_reasoning
+                }
+                
+                if self.result_message and hasattr(self.result_message, 'total_cost_usd'):
+                    cost_usd = self.result_message.total_cost_usd
+                else:
+                    cost_usd = self.claude_recorder.calculate_cost(self.captured_messages)
+                
+                self.claude_recorder.save_step(
+                    step=self.step_counter,
+                    prompt=self.current_prompt,
+                    messages=self.captured_messages,
+                    parsed_action=parsed_action,
+                    total_cost_usd=cost_usd
+                )
+            
             return action_taken
         
         logger.warning("No action was taken by Claude, defaulting to RESET")
