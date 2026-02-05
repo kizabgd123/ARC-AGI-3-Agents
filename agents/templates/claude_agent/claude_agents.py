@@ -383,10 +383,11 @@ class ClaudeCodeAgent(Agent):
             
             if self.latest_reasoning:
                 action.action_data.__dict__["reasoning"] = {
-                    "text": self.latest_reasoning[:16000]
+                    "thought": self.latest_reasoning[:16000]
                 }
+                logger.debug(f"Added reasoning ({len(self.latest_reasoning)} chars) to action")
             else:
-                logger.debug("No reasoning captured for action")
+                logger.warning("No reasoning captured for action - reasoning logs will not appear in replay")
             
             return action
         
