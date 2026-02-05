@@ -23,6 +23,7 @@ class ClaudeCodeAgent(Agent):
     step_counter: int
     mcp_server: Any
     latest_reasoning: str
+    latest_reasoning_dict: dict[str, Any]
     claude_recorder: Optional[ClaudeCodeRecorder]
     captured_messages: list[Any]
     current_prompt: str
@@ -37,6 +38,7 @@ class ClaudeCodeAgent(Agent):
         self.step_counter = 0
         self.cumulative_cost_usd = 0.0
         self.latest_reasoning = ""
+        self.latest_reasoning_dict = {}
         self.current_frame = None
         self.session_id = None
         self.consecutive_errors = 0
@@ -65,6 +67,20 @@ class ClaudeCodeAgent(Agent):
         return any([
             latest_frame.state is GameState.WIN,
         ])
+    
+    def do_action_request(self, action: GameAction) -> FrameData:
+        data = action.action_data.model_dump()
+        
+        if self.latest_reasoning_dict:
+            data["reasoning"] = self.latest_reasoning_dict
+            logger.info(f"Added reasoning to action request: {len(str(self.latest_reasoning_dict))} chars")
+        
+        raw = self.arc_env.step(
+            action,
+            data=data,
+            reasoning=data.get("reasoning", {}),
+        )
+        return self._convert_raw_frame_data(raw)
     
     def build_game_prompt(self, latest_frame: FrameData) -> str:
         try:
@@ -115,7 +131,7 @@ class ClaudeCodeAgent(Agent):
             
             PERSISTENT MEMORY: You have the option to use read_notes/write_notes to maintain insights across turns.
             Track patterns, hypotheses, strategies, and what works/doesn't work. 
-            A recommendation is to write the notes upon the initial analysis of the game, if you choose to analyze the game.
+            A recommendation is to write the notes upon the initial analysis of the game, if you choose to analyze the game, and then iteratively read and write notes as you play the game, as you think you need to.
             
             Before calling a tool, explain your reasoning. Then call exactly ONE tool.
             Only call tools that are in the available_actions list.
@@ -145,6 +161,7 @@ class ClaudeCodeAgent(Agent):
         
         self.current_frame = latest_frame
         self.latest_reasoning = ""
+        self.latest_reasoning_dict = {}
         action_taken: Optional[GameAction] = None
         self.captured_messages = []
         self.current_prompt = self.build_game_prompt(latest_frame)
@@ -217,6 +234,15 @@ class ClaudeCodeAgent(Agent):
                                 
                                 if reasoning_parts:
                                     self.latest_reasoning = " ".join(reasoning_parts)
+                                
+                                non_action_tools = {
+                                    "mcp__arc-game-tools__read_notes",
+                                    "mcp__arc-game-tools__write_notes",
+                                }
+                                
+                                if tool_name in non_action_tools:
+                                    logger.debug(f"Utility tool called: {tool_name}")
+                                    continue
                                 
                                 action_taken = self.parse_action_from_tool(tool_name, block.input)
                                 
@@ -382,11 +408,12 @@ class ClaudeCodeAgent(Agent):
             action.action_data.game_id = self.game_id
             
             if self.latest_reasoning:
-                action.action_data.__dict__["reasoning"] = {
-                    "thought": self.latest_reasoning[:16000] # approximaign a maximum of 16kb of reasoning - see https://docs.arcprize.org/api-reference/commands/execute-simple-action-1
+                self.latest_reasoning_dict = {
+                    "thought": self.latest_reasoning[:16000]
                 }
-                logger.debug(f"Added reasoning ({len(self.latest_reasoning)} chars) to action")
+                logger.info(f"Prepared reasoning for action ({len(self.latest_reasoning)} chars)")
             else:
+                self.latest_reasoning_dict = {}
                 logger.warning("No reasoning captured for action - reasoning logs will not appear in replay")
             
             return action
