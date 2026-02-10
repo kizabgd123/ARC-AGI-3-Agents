@@ -1,14 +1,14 @@
+import base64
+import io
 import json
 import logging
 import os
 import textwrap
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
-import openai
 from arcengine import FrameData, GameAction, GameState
-from openai import OpenAI as OpenAIClient
+from openai import AuthenticationError, BadRequestError, OpenAI as OpenAIClient
 
 from ..agent import Agent
 
@@ -18,26 +18,57 @@ logger = logging.getLogger(__name__)
 class SimpleMemoryCarryover(Agent):
     """LLM agent with explicit one-turn memory carryover only."""
 
-    MAX_ACTIONS = 30
+    MAX_ACTIONS = 50
+    ACTION_LABELS = {
+        "ACTION1": "ACTION1 - Up arrow key, W",
+        "ACTION2": "ACTION2 - Down arrow key, S",
+        "ACTION3": "ACTION3 - Left arrow key, A",
+        "ACTION4": "ACTION4 - Right arrow key, D",
+        "ACTION5": "ACTION5 - Spacebar",
+        "ACTION6": "ACTION6 - Click",
+        "ACTION7": "ACTION7 (special action, Undo) - Z",
+    }
+    ARC_COLOR_PALETTE = (
+        (255, 255, 255),  # 0 White
+        (204, 204, 204),  # 1 Light Gray
+        (153, 153, 153),  # 2 Medium Gray
+        (102, 102, 102),  # 3 Dark Gray
+        (51, 51, 51),     # 4 Very Dark Gray
+        (0, 0, 0),        # 5 Black
+        (229, 58, 163),   # 6 Pink
+        (255, 123, 204),  # 7 Light Pink
+        (249, 60, 49),    # 8 Red
+        (30, 147, 255),   # 9 Blue
+        (136, 216, 241),  # 10 Light Blue
+        (255, 220, 0),    # 11 Yellow
+        (255, 133, 27),   # 12 Orange
+        (146, 18, 49),    # 13 Dark Red
+        (79, 204, 48),    # 14 Green
+        (163, 86, 214),   # 15 Purple
+    )
 
-    GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
     RECORDINGS_DIR_ENV = "RECORDINGS_DIR"
-
-    DEFAULT_MODEL = "gemini-3-flash-preview"
+    BASE_URL = "https://openrouter.ai/api/v1"
+    MODEL = "google/gemini-3-flash-preview"
     REASONING_EFFORT = "high"
 
-    DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    # Multimodal
+    USE_IMAGE_INPUT = True
+    IMAGE_INPUT_SIZE = 512
+
     PARSE_FAILURE_CLEAR_THRESHOLD = 0
-    ENABLE_CHAT_LOG = True
+    ENABLE_CHAT_LOG = True # Log to a readable .md file
 
     TOOL_NAME = "submit_action_and_memory"
     # Prefer modern tool-calling by default; keep legacy function-calling fallback.
     MODEL_REQUIRES_TOOLS = True
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.api_key = os.getenv(self.GEMINI_API_KEY_ENV, "").strip()
-        self.base_url = self.DEFAULT_BASE_URL
-        self.model = self.DEFAULT_MODEL
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("Missing required env var: OPENROUTER_API_KEY")
+        self.base_url = self.BASE_URL
+        self.model = self.MODEL
         self.carryover_memory = ""
         self._locked_available_actions: list[GameAction] | None = None
         self._pending_reasoning: dict[str, Any] | None = None
@@ -47,12 +78,15 @@ class SimpleMemoryCarryover(Agent):
         self._chat_log_path: str | None = None
         self._conversation_log_session_id = uuid.uuid4().hex
         self._conversation_log_announced = False
-        self.client = OpenAIClient(api_key=self.api_key, base_url=self.base_url)
+        self.client = OpenAIClient(
+            api_key=api_key,
+            base_url=self.base_url,
+        )
         super().__init__(*args, **kwargs)
 
     @property
     def name(self) -> str:
-        model_name = getattr(self, "model", self.DEFAULT_MODEL)
+        model_name = getattr(self, "model", self.MODEL)
         sanitized_model_name = model_name.replace("/", "-").replace(":", "-")
         return f"{super().name}.{sanitized_model_name}.memory-carryover"
 
@@ -70,19 +104,21 @@ class SimpleMemoryCarryover(Agent):
         fallback_action = self._deterministic_fallback_action(latest_frame)
         system_prompt = self._build_system_prompt(tool_actions)
         user_prompt = self._build_user_prompt(latest_frame)
-        memory_before = self.carryover_memory
         response: Any | None = None
         request_payload: dict[str, Any] | None = None
 
         try:
             create_kwargs: dict[str, Any] = {
                 "model": self.model,
-                "reasoning_effort": self.REASONING_EFFORT,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
             }
+            if self.REASONING_EFFORT:
+                create_kwargs["extra_body"] = {
+                    "reasoning": {"effort": self.REASONING_EFFORT}
+                }
             if self.MODEL_REQUIRES_TOOLS:
                 create_kwargs["tools"] = self._build_tools(tool_actions)
                 create_kwargs["tool_choice"] = "required"
@@ -111,14 +147,12 @@ class SimpleMemoryCarryover(Agent):
                 memory_after=self.carryover_memory,
             )
             self._log_turn(
-                latest_frame=latest_frame,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response=response,
                 parsed_args=args,
                 action=action,
                 error=None,
-                memory_before=memory_before,
                 memory_after=self.carryover_memory,
                 request_payload=request_payload,
             )
@@ -128,30 +162,41 @@ class SimpleMemoryCarryover(Agent):
             error = f"{type(e).__name__}: {e}"
             action = self._handle_parse_failure(fallback_action, error, response=response)
             self._log_turn(
-                latest_frame=latest_frame,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response=response,
                 parsed_args=None,
                 action=action,
                 error=error,
-                memory_before=memory_before,
                 memory_after=self.carryover_memory,
                 request_payload=request_payload,
             )
             return action
-        except openai.BadRequestError as e:
+        except AuthenticationError as e:
+            error = f"AuthenticationError: {e}"
+            self._log_turn(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response=response,
+                parsed_args=None,
+                action=fallback_action,
+                error=error,
+                memory_after=self.carryover_memory,
+                request_payload=request_payload,
+            )
+            raise RuntimeError(
+                "OpenRouter authentication failed. Check OPENROUTER_API_KEY."
+            ) from e
+        except BadRequestError as e:
             error = f"BadRequestError: {e}"
             action = self._handle_parse_failure(fallback_action, error, response=response)
             self._log_turn(
-                latest_frame=latest_frame,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response=response,
                 parsed_args=None,
                 action=action,
                 error=error,
-                memory_before=memory_before,
                 memory_after=self.carryover_memory,
                 request_payload=request_payload,
             )
@@ -162,60 +207,106 @@ class SimpleMemoryCarryover(Agent):
                 fallback_action, error, response=response
             )
             self._log_turn(
-                latest_frame=latest_frame,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response=response,
                 parsed_args=None,
                 action=action,
                 error=error,
-                memory_before=memory_before,
                 memory_after=self.carryover_memory,
                 request_payload=request_payload,
             )
             return action
 
     def _build_system_prompt(self, available_actions: list[GameAction]) -> str:
-        choose_rule = "Choose exactly one action from PERSISTENT_AVAILABLE_ACTIONS."
-        action6_available = GameAction.ACTION6 in available_actions
         available_names = [action.name for action in available_actions]
-        available_actions_block = "\n".join(
-            f"- {name}" for name in available_names
-        ) or "- <none>"
-        coordinate_rule = ""
+        available_actions_inline = ", ".join(available_names) or "<none>"
+        action_meanings = self._available_action_meanings(available_actions)
+        action6_available = GameAction.ACTION6 in available_actions
+        action6_rule = ""
+        action6_output_rule = ""
         if action6_available:
-            coordinate_rule = (
-                "- If you choose ACTION6, provide x and y "
-                "(both integers in [0,63]). where (0,0) refers to the top left"
+            action6_rule = (
+                "- If you choose ACTION6, you must also provide integer x and y in [0,63].\n"
             )
+            action6_output_rule = "- x and y are required when action_name is ACTION6\n"
         return textwrap.dedent(
             """
-You are a turn-based game-playing agent.
+You are a turn-based game-playing agent. Your task is to analyze the current game state, choose an appropriate action, and manage your memory effectively across turns.
 
-Critical memory constraint:
-- You do NOT have hidden memory.
-- You only remember text shown in MEMORY_FROM_PREVIOUS_TURN.
-- The text you return in memory_for_next_turn fully replaces prior memory.
-- If you would like to compare the current state to the previous state, you have to store all relevant information about the current state in your memory for use during your next turn.
+## Critical Memory Constraint
 
-PERSISTENT_AVAILABLE_ACTIONS (constant for this game):
-{available_actions_block}
+You do NOT have persistent hidden memory. Your memory works as follows:
+- You only have access to information explicitly provided in MEMORY_FROM_PREVIOUS_TURN
+- When you write memory_for_next_turn, it COMPLETELY REPLACES all previous memory
+- If you need to compare the current state to a previous state, you must have stored the relevant previous state information in your memory during the last turn
+- Any information not included in your memory_for_next_turn output will be permanently lost
 
-Action rules:
-- {choose_rule}
-{coordinate_rule}
+## Your Task
 
-Output rules:
-- You must reply by calling submit_action_and_memory exactly once.
+1. Analyze the current game state (provided as frames)
+2. Review your memory from the previous turn
+3. Choose exactly one action from the available options
+4. Determine what information you want to remember for future turns
+5. Submit your chosen action and memory
+
+## Available Actions
+
+Choose exactly ONE action from ({available_actions_inline}).
+Available action meanings:
+{action_meanings}
+{action6_rule}
+## Instructions for Your Response
+
+Before making your final decision, work through your reasoning in <game_analysis> tags inside your thinking block:
+
+1. Current State Understanding: Parse the frames data and note key observations.
+2. Context Review: Review the information you stored in memory from the previous turn.
+3. State Comparison: If memory contains previous-state information, identify what changed and what stayed the same.
+4. Memory Planning: Decide what to keep, discard, and add to memory_for_next_turn.
+5. Action Selection: Choose the single most appropriate action.
+
+Call submit_action_and_memory exactly once with action_name and memory_for_next_turn.
+- Use this function call as your final output.
+- action_name: one of ({available_actions_inline})
+- memory_for_next_turn: all information you want to persist to your next turn
+{action6_output_rule}
+Do not output pseudo-code or plain text action descriptions.
             """.format(
-                available_actions_block=available_actions_block,
-                choose_rule=choose_rule,
-                coordinate_rule=coordinate_rule,
+                available_actions_inline=available_actions_inline,
+                action_meanings=action_meanings,
+                action6_rule=action6_rule,
+                action6_output_rule=action6_output_rule,
             )
         ).strip()
 
-    def _build_user_prompt(self, latest_frame: FrameData) -> str:
+    def _build_user_prompt(
+        self, latest_frame: FrameData
+    ) -> str | list[dict[str, Any]]:
         memory_text = self.carryover_memory
+        if self.USE_IMAGE_INPUT:
+            prompt_content: list[dict[str, Any]] = [
+                {
+                    "type": "text",
+                    "text": "FRAMES (attached as images in Grid order):",
+                }
+            ]
+            for index, grid in enumerate(latest_frame.frame):
+                prompt_content.append({"type": "text", "text": f"Grid {index}:"})
+                prompt_content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": self._grid_to_data_url(grid)},
+                    }
+                )
+            prompt_content.append(
+                {
+                    "type": "text",
+                    "text": f"MEMORY_FROM_PREVIOUS_TURN:\n{memory_text}",
+                }
+            )
+            return prompt_content
+
         return textwrap.dedent(
             """
 FRAMES:
@@ -223,10 +314,6 @@ FRAMES:
 
 MEMORY_FROM_PREVIOUS_TURN:
 {memory}
-
-What action would you like to take?
-Frames are formatted as CSV rows for each grid (comma-separated integer values).
-Also write all memory you want to persist for the next turn in memory_for_next_turn.
             """.format(
                 frames=self._pretty_print_3d(latest_frame.frame),
                 memory=memory_text,
@@ -297,6 +384,19 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
         if not token:
             raise ValueError("missing action_name")
         return GameAction.from_name(token)
+
+    def _available_action_meanings(self, available_actions: list[GameAction]) -> str:
+        lines: list[str] = []
+        for action in available_actions:
+            action_name = action.name
+            label = self.ACTION_LABELS.get(action_name)
+            if label is None:
+                lines.append(f"- {action_name}")
+            else:
+                lines.append(f"- {label}")
+        if not lines:
+            return "- <none>"
+        return "\n".join(lines)
 
     def _extract_tool_arguments(self, response: Any) -> dict[str, Any]:
         if not response.choices:
@@ -498,6 +598,37 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
             lines.append("")
         return "\n".join(lines).strip()
 
+    def _grid_to_data_url(self, grid: list[list[Any]]) -> str:
+        try:
+            from PIL import Image
+        except ImportError as e:
+            raise RuntimeError(
+                "USE_IMAGE_INPUT=True requires Pillow. Install dependency 'pillow'."
+            ) from e
+
+        height = len(grid)
+        width = len(grid[0]) if height > 0 else 0
+        if height == 0 or width == 0:
+            raise ValueError("Cannot render empty grid image.")
+        if any(len(row) != width for row in grid):
+            raise ValueError("Grid rows must all have the same width.")
+
+        img = Image.new("RGB", (width, height), "black")
+        pixels = img.load()
+        for y, row in enumerate(grid):
+            for x, value in enumerate(row):
+                try:
+                    index = int(value) % len(self.ARC_COLOR_PALETTE)
+                except (TypeError, ValueError):
+                    index = 0
+                pixels[x, y] = self.ARC_COLOR_PALETTE[index]
+
+        img = img.resize((self.IMAGE_INPUT_SIZE, self.IMAGE_INPUT_SIZE), Image.NEAREST)
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG", optimize=True)
+        payload = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{payload}"
+
     def _coerce_action(self, raw: Any) -> GameAction | None:
         if isinstance(raw, GameAction):
             return raw
@@ -524,52 +655,26 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
         )
         return os.path.join(directory, filename)
 
-    def _split_user_prompt_sections(self, user_prompt: str) -> tuple[str, str, str]:
-        memory_header = "MEMORY_FROM_PREVIOUS_TURN:\n"
-        frames_header = "\n\nFRAMES:\n"
-        available_actions_header = "\n\nAVAILABLE_ACTIONS:\n"
-
-        memory_start = user_prompt.find(memory_header)
-        frames_start = user_prompt.find(frames_header)
-        available_actions_start = user_prompt.find(available_actions_header)
-
-        if (
-            memory_start == 0
-            and frames_start > memory_start
-            and available_actions_start > frames_start
-        ):
-            memory_text_start = memory_start + len(memory_header)
-            frames_text_start = frames_start + len(frames_header)
-            # Keep "AVAILABLE_ACTIONS:" label in the instructions block.
-            instructions_text_start = available_actions_start + 2
-
-            memory_text = user_prompt[memory_text_start:frames_start]
-            frame_text = user_prompt[frames_text_start:available_actions_start]
-            instructions_text = user_prompt[instructions_text_start:]
-            return memory_text, frame_text, instructions_text
-
-        # Fallback keeps all original text instead of inventing a summary.
-        return "<unparsed>", user_prompt, user_prompt
-
     def _format_chat_turn(
         self,
         *,
-        timestamp: str,
         turn_index: int,
-        latest_frame: FrameData,
-        available_actions: list[str],
         system_prompt: str,
-        user_prompt: str,
+        user_prompt: str | list[dict[str, Any]],
         parsed_args: dict[str, Any] | None,
         response: Any | None,
         action: GameAction,
         error: str | None,
-        memory_before: str,
         memory_after: str,
-        state_name: str,
         request_payload: dict[str, Any] | None,
     ) -> str:
         response_payload = self._raw_response_payload(response)
+        if isinstance(user_prompt, str):
+            user_prompt_fence = "text"
+            user_prompt_text = user_prompt
+        else:
+            user_prompt_fence = "json"
+            user_prompt_text = json.dumps(user_prompt, ensure_ascii=True, indent=2)
         action_data = action.action_data.model_dump()
         action6_lines: list[str] = []
         if action.name == "ACTION6":
@@ -585,8 +690,8 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
             "```",
             "",
             "### User Prompt",
-            "```text",
-            user_prompt,
+            f"```{user_prompt_fence}",
+            user_prompt_text,
             "```",
             "",
             "### API Request (Raw)",
@@ -624,15 +729,28 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
             return None
         if hasattr(response, "model_dump"):
             try:
-                return response.model_dump()
+                return self._redact_thought_signatures(response.model_dump())
             except Exception:
                 pass
         if hasattr(response, "to_dict"):
             try:
-                return response.to_dict()
+                return self._redact_thought_signatures(response.to_dict())
             except Exception:
                 pass
         return {"repr": repr(response)}
+
+    def _redact_thought_signatures(self, payload: Any) -> Any:
+        if isinstance(payload, dict):
+            redacted: dict[str, Any] = {}
+            for key, value in payload.items():
+                if key == "thought_signature":
+                    redacted[key] = "(hidden for brevity)"
+                else:
+                    redacted[key] = self._redact_thought_signatures(value)
+            return redacted
+        if isinstance(payload, list):
+            return [self._redact_thought_signatures(item) for item in payload]
+        return payload
 
     def _conversation_response_payload(self, response: Any | None) -> dict[str, Any] | None:
         if response is None:
@@ -679,14 +797,12 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
     def _log_turn(
         self,
         *,
-        latest_frame: FrameData,
         system_prompt: str,
-        user_prompt: str,
+        user_prompt: str | list[dict[str, Any]],
         response: Any | None,
         parsed_args: dict[str, Any] | None,
         action: GameAction,
         error: str | None,
-        memory_before: str,
         memory_after: str,
         request_payload: dict[str, Any] | None,
     ) -> None:
@@ -702,28 +818,15 @@ Also write all memory you want to persist for the next turn in memory_for_next_t
                 )
                 self._conversation_log_announced = True
 
-        available_actions = [a.name for a in self._available_actions(latest_frame)]
-        frame_state = getattr(latest_frame, "state", None)
-        if hasattr(frame_state, "name"):
-            state_name = frame_state.name
-        else:
-            state_name = str(frame_state)
-
-        timestamp = datetime.now(timezone.utc).isoformat()
         chat_turn = self._format_chat_turn(
-            timestamp=timestamp,
             turn_index=self.action_counter,
-            latest_frame=latest_frame,
-            available_actions=available_actions,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             parsed_args=parsed_args,
             response=response,
             action=action,
             error=error,
-            memory_before=memory_before,
             memory_after=memory_after,
-            state_name=state_name,
             request_payload=request_payload,
         )
         with open(self._chat_log_path, "a", encoding="utf-8") as f:
