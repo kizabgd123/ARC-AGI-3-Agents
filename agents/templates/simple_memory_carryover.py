@@ -59,7 +59,7 @@ class SimpleMemoryCarryover(Agent):
     USE_IMAGE_INPUT = False
     IMAGE_INPUT_SIZE = 512
 
-    ENABLE_CHAT_LOG = False # Log to a readable .md file
+    ENABLE_CHAT_LOG = True # Log to a readable .md file
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -198,7 +198,8 @@ class SimpleMemoryCarryover(Agent):
     def _build_system_prompt(
         self, available_actions: list[GameAction], latest_state: GameState
     ) -> str:
-        available_names = [action.name for action in available_actions]
+        prompt_actions = self._prompt_actions(available_actions)
+        available_names = [action.name for action in prompt_actions]
         available_actions_inline = ", ".join(available_names) or "<none>"
         non_click_action_names = [
             action_name
@@ -206,8 +207,8 @@ class SimpleMemoryCarryover(Agent):
             if action_name not in (GameAction.ACTION6.name, GameAction.RESET.name)
         ]
         non_click_actions_inline = ", ".join(non_click_action_names) or "<none>"
-        action_mappings = self._available_action_mappings(available_actions)
-        action6_available = GameAction.ACTION6 in available_actions
+        action_mappings = self._available_action_mappings(prompt_actions)
+        action6_available = GameAction.ACTION6 in prompt_actions
         game_state = latest_state.name if isinstance(latest_state, GameState) else str(latest_state)
         game_state_rule = (
             "- Current state is GAME_OVER. The previous run is lost.\n"
@@ -287,6 +288,20 @@ Formatting rules:
                 action6_format_rule=action6_format_rule,
             )
         ).strip()
+
+    def _prompt_actions(self, available_actions: list[GameAction]) -> list[GameAction]:
+        has_special_action = any(
+            action in available_actions
+            for action in (GameAction.ACTION6, GameAction.ACTION7)
+        )
+        if not has_special_action:
+            return available_actions
+
+        prompt_actions: list[GameAction] = []
+        for preferred in (GameAction.ACTION6, GameAction.ACTION7, GameAction.RESET):
+            if preferred in available_actions:
+                prompt_actions.append(preferred)
+        return prompt_actions or available_actions
 
     def _build_user_prompt(self, latest_frame: FrameData) -> str | list[dict[str, Any]]:
         memory_text = self.carryover_memory
