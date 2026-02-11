@@ -20,7 +20,12 @@ class SimpleMemoryCarryover(Agent):
     """LLM agent with explicit one-turn memory carryover only."""
 
     MAX_ACTIONS = 50
-    ACTION_LABELS = {
+    ACTION6_COORD_RETRY_COUNT = 2
+    GAME_ACTION_PROFILES: dict[str, tuple[GameAction, ...]] = {
+        # Click-only puzzle profile.
+        "ft09": (GameAction.ACTION6, GameAction.RESET),
+    }
+    ACTION_MAPPINGS = {
         "RESET": "RESET - Reset current level",
         "ACTION1": "ACTION1 - Up arrow key, W",
         "ACTION2": "ACTION2 - Down arrow key, S",
@@ -58,7 +63,6 @@ class SimpleMemoryCarryover(Agent):
     USE_IMAGE_INPUT = False
     IMAGE_INPUT_SIZE = 512
 
-    PARSE_FAILURE_CLEAR_THRESHOLD = 0
     ENABLE_CHAT_LOG = False # Log to a readable .md file
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -70,7 +74,7 @@ class SimpleMemoryCarryover(Agent):
         self.carryover_memory = ""
         self._pending_reasoning: dict[str, Any] | None = None
         self.consecutive_parse_failures = 0
-        self.parse_failure_clear_threshold = self.PARSE_FAILURE_CLEAR_THRESHOLD
+        self._last_levels_completed: int | None = None
         self._log_conversation = self.ENABLE_CHAT_LOG
         self._chat_log_path: str | None = None
         self._conversation_log_session_id = uuid.uuid4().hex
@@ -95,124 +99,119 @@ class SimpleMemoryCarryover(Agent):
     ) -> GameAction:
         available_actions = self._available_actions(latest_frame)
         fallback_action = self._deterministic_fallback_action(latest_frame)
+        max_attempts = 1 + max(0, int(self.ACTION6_COORD_RETRY_COUNT))
         system_prompt = self._build_system_prompt(
             available_actions, latest_state=latest_frame.state
         )
         user_prompt = self._build_user_prompt(latest_frame)
         response: Any | None = None
         request_payload: dict[str, Any] | None = None
-
-        try:
-            create_kwargs: dict[str, Any] = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+        create_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if self.REASONING_EFFORT:
+            create_kwargs["extra_body"] = {
+                "reasoning": {"effort": self.REASONING_EFFORT}
             }
-            if self.REASONING_EFFORT:
-                create_kwargs["extra_body"] = {
-                    "reasoning": {"effort": self.REASONING_EFFORT}
-                }
+        request_payload = create_kwargs
 
-            request_payload = create_kwargs
-            response = self.client.chat.completions.create(**create_kwargs)
-            args = self._extract_action_and_memory_from_response(response)
+        last_error: str | None = None
+        for attempt_index in range(max_attempts):
+            try:
+                response = self.client.chat.completions.create(**create_kwargs)
+                args = self._extract_action_and_memory_from_response(response)
 
-            action, action_note = self._action_from_arguments(
-                args=args,
-                latest_frame=latest_frame,
-                fallback_action=fallback_action,
-                available_actions=available_actions,
-            )
+                action, action_note = self._action_from_arguments(
+                    args=args,
+                    latest_frame=latest_frame,
+                    fallback_action=fallback_action,
+                    available_actions=available_actions,
+                )
+                retry_error = self._retry_error_from_action_note(action_note)
+                if retry_error is not None:
+                    if attempt_index < (max_attempts - 1):
+                        raise ValueError(retry_error)
+                    raise ValueError(f"{retry_error} after retries.")
 
-            self.carryover_memory = self._extract_memory(args)
-            self.consecutive_parse_failures = 0
-            self._pending_reasoning = self._build_action_reasoning(
-                parse_status="ok",
-                action_note=action_note,
-                response=response,
-                parsed_args=args,
-                memory_after=self.carryover_memory,
-            )
-            self._log_turn(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response=response,
-                parsed_args=args,
-                action=action,
-                error=None,
-                memory_after=self.carryover_memory,
-                request_payload=request_payload,
-            )
-            return action
+                self.carryover_memory = self._extract_memory(args)
+                self.consecutive_parse_failures = 0
+                self._pending_reasoning = self._build_action_reasoning(
+                    parse_status="ok",
+                    action_note=action_note,
+                    response=response,
+                    parsed_args=args,
+                    memory_after=self.carryover_memory,
+                )
+                self._log_turn(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    response=response,
+                    parsed_args=args,
+                    action=action,
+                    error=None,
+                    memory_after=self.carryover_memory,
+                    request_payload=request_payload,
+                )
+                return action
+            except AuthenticationError as e:
+                error = f"AuthenticationError: {e}"
+                self._log_turn(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    response=response,
+                    parsed_args=None,
+                    action=fallback_action,
+                    error=error,
+                    memory_after=self.carryover_memory,
+                    request_payload=request_payload,
+                )
+                raise RuntimeError(
+                    "OpenRouter authentication failed. Check OPENROUTER_API_KEY."
+                ) from e
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError, BadRequestError) as e:
+                last_error = f"{type(e).__name__}: {e}"
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
 
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            error = f"{type(e).__name__}: {e}"
-            action = self._handle_parse_failure(fallback_action, error, response=response)
-            self._log_turn(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response=response,
-                parsed_args=None,
-                action=action,
-                error=error,
-                memory_after=self.carryover_memory,
-                request_payload=request_payload,
-            )
-            return action
-        except AuthenticationError as e:
-            error = f"AuthenticationError: {e}"
-            self._log_turn(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response=response,
-                parsed_args=None,
-                action=fallback_action,
-                error=error,
-                memory_after=self.carryover_memory,
-                request_payload=request_payload,
-            )
-            raise RuntimeError(
-                "OpenRouter authentication failed. Check OPENROUTER_API_KEY."
-            ) from e
-        except BadRequestError as e:
-            error = f"BadRequestError: {e}"
-            action = self._handle_parse_failure(fallback_action, error, response=response)
-            self._log_turn(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response=response,
-                parsed_args=None,
-                action=action,
-                error=error,
-                memory_after=self.carryover_memory,
-                request_payload=request_payload,
-            )
-            return action
-        except Exception as e:
-            error = f"{type(e).__name__}: {e}"
-            action = self._handle_parse_failure(
-                fallback_action, error, response=response
-            )
-            self._log_turn(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response=response,
-                parsed_args=None,
-                action=action,
-                error=error,
-                memory_after=self.carryover_memory,
-                request_payload=request_payload,
-            )
-            return action
+            if attempt_index < (max_attempts - 1):
+                logger.warning(
+                    "Action selection failed; retrying with the same prompt (attempt %s/%s). Error: %s",
+                    attempt_index + 1,
+                    max_attempts,
+                    last_error,
+                )
+                continue
+
+        error = last_error or "Action selection failed after retries."
+        action = self._handle_parse_failure(fallback_action, error, response=response)
+        self._log_turn(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response=response,
+            parsed_args=None,
+            action=action,
+            error=error,
+            memory_after=self.carryover_memory,
+            request_payload=request_payload,
+        )
+        return action
 
     def _build_system_prompt(
         self, available_actions: list[GameAction], latest_state: GameState
     ) -> str:
         available_names = [action.name for action in available_actions]
         available_actions_inline = ", ".join(available_names) or "<none>"
-        action_meanings = self._available_action_meanings(available_actions)
+        non_click_action_names = [
+            action_name
+            for action_name in available_names
+            if action_name not in (GameAction.ACTION6.name, GameAction.RESET.name)
+        ]
+        non_click_actions_inline = ", ".join(non_click_action_names) or "<none>"
+        action_mappings = self._available_action_mappings(available_actions)
         action6_available = GameAction.ACTION6 in available_actions
         game_state = latest_state.name if isinstance(latest_state, GameState) else str(latest_state)
         game_state_rule = (
@@ -223,6 +222,11 @@ class SimpleMemoryCarryover(Agent):
         )
         action6_rule = ""
         action6_format_rule = ""
+        non_click_format_rule = ""
+        if non_click_action_names:
+            non_click_format_rule = (
+                f"- For non-click actions, use `<action>ACTION_NAME</action>` where ACTION_NAME is one of ({non_click_actions_inline})\n"
+            )
         if action6_available:
             action6_rule = (
                 "- If you choose ACTION6, you must also provide integer x and y in [0,63].\n"
@@ -253,8 +257,8 @@ You do NOT have persistent hidden memory. Your memory works as follows:
 ## Available Actions
 
 Choose exactly ONE action from ({available_actions_inline}).
-Available action meanings:
-{action_meanings}
+Available action mappings:
+{action_mappings}
 Current game state: {game_state}
 {game_state_rule}
 {action6_rule}
@@ -273,28 +277,31 @@ Your final output must be plain text containing exactly:
 2) one <memory>...</memory> block
 
 Formatting rules:
-- For simple actions, use `<action>ACTION_NAME</action>` where ACTION_NAME is one of ({available_actions_inline})
-- For reset, use `<action>RESET</action>`
+{non_click_format_rule}
 {action6_format_rule}
 - Put all carryover memory in `<memory>...</memory>` (this fully replaces previous memory)
 - Do not use tool calls or function calls
 - Do not output pseudo-code or plain text action descriptions outside these tags
             """.format(
                 available_actions_inline=available_actions_inline,
-                action_meanings=action_meanings,
+                action_mappings=action_mappings,
                 game_state=game_state,
                 game_state_rule=game_state_rule,
                 action6_rule=action6_rule,
+                non_click_format_rule=non_click_format_rule,
                 action6_format_rule=action6_format_rule,
             )
         ).strip()
 
-    def _build_user_prompt(
-        self, latest_frame: FrameData
-    ) -> str | list[dict[str, Any]]:
+    def _build_user_prompt(self, latest_frame: FrameData) -> str | list[dict[str, Any]]:
         memory_text = self.carryover_memory
+        turn_data_text = self._build_turn_data_text(latest_frame)
         if self.USE_IMAGE_INPUT:
             prompt_content: list[dict[str, Any]] = [
+                {
+                    "type": "text",
+                    "text": f"TURN_DATA:\n{turn_data_text}",
+                },
                 {
                     "type": "text",
                     "text": "FRAMES (attached as images in Grid order):",
@@ -318,16 +325,80 @@ Formatting rules:
 
         return textwrap.dedent(
             """
+TURN_DATA:
+{turn_data}
+
 FRAMES:
 {frames}
 
 MEMORY_FROM_PREVIOUS_TURN:
 {memory}
             """.format(
+                turn_data=turn_data_text,
                 frames=self._pretty_print_3d(latest_frame.frame),
                 memory=memory_text,
             )
         ).strip()
+
+    def _build_turn_data_text(
+        self, latest_frame: FrameData
+    ) -> str:
+        state_name = self._frame_state_name(latest_frame)
+        levels_completed = self._coerce_optional_int(
+            getattr(latest_frame, "levels_completed", None)
+        )
+        win_levels = self._coerce_optional_int(getattr(latest_frame, "win_levels", None))
+        current_level_index = self._current_level_index(levels_completed, win_levels)
+
+        lines = [
+            f"- game_state: {state_name}",
+            f"- current_level_index: {self._format_optional_int(current_level_index)}",
+        ]
+        progress_event = self._detect_progress_event(levels_completed)
+        if progress_event == "level":
+            lines.append("New level reached!")
+        return "\n".join(lines)
+
+    def _frame_state_name(self, frame: FrameData) -> str:
+        state = getattr(frame, "state", None)
+        if isinstance(state, GameState):
+            return state.name
+        return str(state)
+
+    def _coerce_optional_int(self, value: Any) -> int | None:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _format_optional_int(self, value: int | None) -> str:
+        if value is None:
+            return "unknown"
+        return str(value)
+
+    def _current_level_index(
+        self, levels_completed: int | None, win_levels: int | None
+    ) -> int | None:
+        if levels_completed is None:
+            return None
+        candidate = levels_completed + 1
+        if win_levels is not None and win_levels > 0:
+            return min(candidate, win_levels)
+        return candidate
+
+    def _detect_progress_event(self, levels_completed: int | None) -> str | None:
+        progress_event: str | None = None
+        if (
+            levels_completed is not None
+            and self._last_levels_completed is not None
+            and levels_completed > self._last_levels_completed
+        ):
+            progress_event = "level"
+
+        self._last_levels_completed = levels_completed
+        return progress_event
 
     def _parse_action_token(self, action_token: str) -> GameAction:
         token = action_token.strip().upper()
@@ -335,11 +406,34 @@ MEMORY_FROM_PREVIOUS_TURN:
             raise ValueError("missing action_name")
         return GameAction.from_name(token)
 
-    def _available_action_meanings(self, available_actions: list[GameAction]) -> str:
+    def _available_action_mappings(self, available_actions: list[GameAction]) -> str:
+        # If ACTION6/ACTION7 exists, focus descriptions on special actions to reduce noise.
+        has_special_action = any(
+            action in available_actions
+            for action in (GameAction.ACTION6, GameAction.ACTION7)
+        )
+
+        if has_special_action:
+            lines: list[str] = []
+            for action_name in (
+                GameAction.ACTION6.name,
+                GameAction.ACTION7.name,
+                GameAction.RESET.name,
+            ):
+                action = next(
+                    (candidate for candidate in available_actions if candidate.name == action_name),
+                    None,
+                )
+                if action is None:
+                    continue
+                label = self.ACTION_MAPPINGS.get(action_name, action_name)
+                lines.append(f"- {label}")
+            return "\n".join(lines) if lines else "- <none>"
+
         lines: list[str] = []
         for action in available_actions:
             action_name = action.name
-            label = self.ACTION_LABELS.get(action_name)
+            label = self.ACTION_MAPPINGS.get(action_name)
             if label is None:
                 lines.append(f"- {action_name}")
             else:
@@ -458,18 +552,26 @@ MEMORY_FROM_PREVIOUS_TURN:
             return fallback_action, f"action_not_available={requested_action.name}"
 
         if requested_action.is_complex():
-            x, y = self._parse_coordinates(args)
+            x, y = self._parse_coordinates(args, latest_frame)
             if x is None or y is None:
-                safe_fallback = self._fallback_non_complex_action(
-                    latest_frame, available_actions
-                )
-                return safe_fallback, "invalid_coordinates_for_action6"
+                return fallback_action, "invalid_coordinates_for_action6"
             requested_action.set_data({"x": x, "y": y})
             return requested_action, "ok_action6"
 
         return requested_action, "ok_simple"
 
-    def _parse_coordinates(self, args: dict[str, Any]) -> tuple[int | None, int | None]:
+    def _retry_error_from_action_note(self, action_note: str) -> str | None:
+        if action_note == "invalid_coordinates_for_action6":
+            return "ACTION6 was selected without valid coordinates"
+        if action_note.startswith("invalid_action_name="):
+            return f"Model selected an invalid action token ({action_note})"
+        if action_note.startswith("action_not_available="):
+            return f"Model selected an unavailable action ({action_note})"
+        return None
+
+    def _parse_coordinates(
+        self, args: dict[str, Any], latest_frame: FrameData
+    ) -> tuple[int | None, int | None]:
         try:
             x = int(args.get("x"))
             y = int(args.get("y"))
@@ -477,19 +579,38 @@ MEMORY_FROM_PREVIOUS_TURN:
             return None, None
         if not (0 <= x <= 63 and 0 <= y <= 63):
             return None, None
+        max_x, max_y = self._frame_coordinate_limits(latest_frame)
+        if not (0 <= x <= max_x and 0 <= y <= max_y):
+            return None, None
         return x, y
+
+    def _frame_coordinate_limits(self, latest_frame: FrameData) -> tuple[int, int]:
+        grids = getattr(latest_frame, "frame", None) or []
+        if not isinstance(grids, list) or len(grids) == 0:
+            return 63, 63
+
+        first_grid = grids[0]
+        if not isinstance(first_grid, list) or len(first_grid) == 0:
+            return 63, 63
+
+        row_lengths: list[int] = []
+        for row in first_grid:
+            if isinstance(row, list) and len(row) > 0:
+                row_lengths.append(len(row))
+        if not row_lengths:
+            return 63, 63
+
+        # Use the smallest row width to stay within non-rectangular grid safety.
+        width = min(row_lengths)
+        height = len(row_lengths)
+        max_x = max(0, min(63, width - 1))
+        max_y = max(0, min(63, height - 1))
+        return max_x, max_y
 
     def _handle_parse_failure(
         self, fallback_action: GameAction, error: str, response: Any | None = None
     ) -> GameAction:
         self.consecutive_parse_failures += 1
-        cleared_memory = False
-        if (
-            self.parse_failure_clear_threshold > 0
-            and self.consecutive_parse_failures >= self.parse_failure_clear_threshold
-        ):
-            self.carryover_memory = ""
-            cleared_memory = True
 
         self._pending_reasoning = self._build_action_reasoning(
             parse_status="failed",
@@ -499,7 +620,6 @@ MEMORY_FROM_PREVIOUS_TURN:
             memory_after=self.carryover_memory,
             error=error,
             parse_failures_in_row=self.consecutive_parse_failures,
-            memory_cleared=cleared_memory,
         )
         return fallback_action
 
@@ -508,11 +628,26 @@ MEMORY_FROM_PREVIOUS_TURN:
         data = action.action_data.model_dump()
         reasoning_payload = self._pending_reasoning
         try:
-            raw = self.arc_env.step(
-                action,
-                data=data,
-                reasoning=reasoning_payload,
-            )
+            raw = None
+            try:
+                raw = self.arc_env.step(
+                    action,
+                    data=data,
+                    reasoning=reasoning_payload,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Action request failed for %s with data=%s; falling back to latest observation. Error: %s",
+                    action.name,
+                    json.dumps(data, ensure_ascii=True),
+                    e,
+                )
+            if raw is None:
+                raw = getattr(self.arc_env, "observation_space", None)
+            if raw is None:
+                raise RuntimeError(
+                    "Action request failed and no observation fallback was available."
+                )
             if (
                 raw is not None
                 and reasoning_payload is not None
@@ -534,7 +669,6 @@ MEMORY_FROM_PREVIOUS_TURN:
         memory_after: str,
         error: str | None = None,
         parse_failures_in_row: int | None = None,
-        memory_cleared: bool | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "agent_type": "simple_memory_carryover",
@@ -551,8 +685,6 @@ MEMORY_FROM_PREVIOUS_TURN:
             payload["error"] = error
         if parse_failures_in_row is not None:
             payload["parse_failures_in_row"] = parse_failures_in_row
-        if memory_cleared is not None:
-            payload["memory_cleared"] = memory_cleared
         return payload
 
     def _available_actions(self, latest_frame: FrameData) -> list[GameAction]:
@@ -566,7 +698,30 @@ MEMORY_FROM_PREVIOUS_TURN:
                 parsed.append(action)
         if GameAction.RESET not in parsed:
             parsed.append(GameAction.RESET)
-        return parsed
+
+        filtered_by_profile = self._filter_actions_by_game_profile(parsed)
+        return filtered_by_profile
+
+    def _filter_actions_by_game_profile(
+        self, actions: list[GameAction]
+    ) -> list[GameAction]:
+        profile = self._game_action_profile()
+        if profile is None:
+            return actions
+
+        filtered = [action for action in actions if action in profile]
+        if filtered:
+            return filtered
+
+        # Fallback if the profile does not match current environment actions.
+        return actions
+
+    def _game_action_profile(self) -> tuple[GameAction, ...] | None:
+        raw_game_id = getattr(self, "game_id", "") or ""
+        game_key = raw_game_id.split("-", 1)[0].strip().lower()
+        if not game_key:
+            return None
+        return self.GAME_ACTION_PROFILES.get(game_key)
 
     def _deterministic_fallback_action(self, latest_frame: FrameData) -> GameAction:
         available_actions = self._available_actions(latest_frame)
@@ -587,14 +742,6 @@ MEMORY_FROM_PREVIOUS_TURN:
         if GameAction.RESET in available_actions:
             return GameAction.RESET
         return GameAction.RESET
-
-    def _fallback_non_complex_action(
-        self, latest_frame: FrameData, available_actions: list[GameAction]
-    ) -> GameAction:
-        for action in available_actions:
-            if action != GameAction.RESET and action.is_simple():
-                return action
-        return self._deterministic_fallback_action(latest_frame)
 
     def _pretty_print_3d(self, array_3d: list[list[list[Any]]]) -> str:
         lines = []
@@ -748,15 +895,26 @@ MEMORY_FROM_PREVIOUS_TURN:
 
     def _redact_thought_signatures(self, payload: Any) -> Any:
         if isinstance(payload, dict):
+            if payload.get("type") == "reasoning.encrypted":
+                # Drop encrypted reasoning blocks from logs to keep transcripts concise.
+                return None
+
             redacted: dict[str, Any] = {}
             for key, value in payload.items():
                 if key == "thought_signature":
                     redacted[key] = "(hidden for brevity)"
                 else:
-                    redacted[key] = self._redact_thought_signatures(value)
+                    sanitized_value = self._redact_thought_signatures(value)
+                    if sanitized_value is not None:
+                        redacted[key] = sanitized_value
             return redacted
         if isinstance(payload, list):
-            return [self._redact_thought_signatures(item) for item in payload]
+            sanitized_items = []
+            for item in payload:
+                sanitized = self._redact_thought_signatures(item)
+                if sanitized is not None:
+                    sanitized_items.append(sanitized)
+            return sanitized_items
         return payload
 
     def _conversation_response_payload(self, response: Any | None) -> dict[str, Any] | None:
@@ -772,7 +930,9 @@ MEMORY_FROM_PREVIOUS_TURN:
         if choices:
             message = getattr(choices[0], "message", None)
             if message is not None:
-                payload["content"] = getattr(message, "content", None)
+                payload["content"] = self._redact_thought_signatures(
+                    getattr(message, "content", None)
+                )
                 function_call = getattr(message, "function_call", None)
                 if function_call is not None:
                     payload["function_call"] = {
