@@ -97,6 +97,7 @@ class ConversationRollingWindow(Agent):
             )
         self._level_action_counter: int = 0
         self._last_levels_completed: int = 0
+        self._level_just_advanced: bool = False
 
         # Call kwargs passed directly to chat.completions.create()
         self.MODEL: str = call_cfg["model"]
@@ -334,6 +335,7 @@ class ConversationRollingWindow(Agent):
             )
             self._level_action_counter = 0
             self._last_levels_completed = current_level
+            self._level_just_advanced = True
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         if latest_frame.state is GameState.WIN:
@@ -387,9 +389,14 @@ class ConversationRollingWindow(Agent):
             )
 
         # Normal turn: append frame, call the model, parse action
-        self.conversation.append(
-            {"role": "user", "content": self.build_frame_content(latest_frame)}
-        )
+        frame_content = self.build_frame_content(latest_frame)
+        if self._level_just_advanced:
+            frame_content = (
+                f"Next level - Now on level {latest_frame.levels_completed + 1}\n\n"
+                + frame_content
+            )
+            self._level_just_advanced = False
+        self.conversation.append({"role": "user", "content": frame_content})
 
         actions = self._get_actions(latest_frame)
         start = time.monotonic()
