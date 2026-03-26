@@ -30,3 +30,36 @@ Game History: {game_history}
 
 Be skeptical. Check if this action has failed before or if it ignores a visible pattern.
 If the plan is good, respond with 'APPROVED'. Otherwise, provide specific feedback."""
+
+import os
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+
+def get_model():
+    return ChatOpenAI(model="gpt-4o", api_key=os.getenv("OPENAI_API_KEY"))
+
+def planner(state: AgentState):
+    model = get_model()
+    critique = state["thinking_history"][-1].critique if state["thinking_history"] else "None"
+    prompt = PLANNER_PROMPT.format(
+        grid=state["data"].grid,
+        actions=state["data"].available_actions,
+        critique=critique,
+        game_history=state["game_history"]
+    )
+    response = model.invoke([SystemMessage(content=prompt)])
+    # In a real implementation, we'd parse the action from the response
+    # For now, let's assume it returns a structured format or we parse it
+    return {"iteration_count": state["iteration_count"]} # Placeholder for actual update
+
+def critic(state: AgentState):
+    model = get_model()
+    last_plan = "..." # Extract from state
+    prompt = CRITIC_PROMPT.format(
+        plan=last_plan,
+        grid=state["data"].grid,
+        game_history=state["game_history"]
+    )
+    response = model.invoke([SystemMessage(content=prompt)])
+    is_approved = "APPROVED" in response.content.upper()
+    return {"thinking_history": state["thinking_history"] + [ThinkingHistory(iteration=state["iteration_count"], plan=last_plan, critique=response.content)]}
