@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "arc-agi>=0.9.1",
     "dotenv>=0.9.9",
+    "flask",
     "langchain",
     "langchain-core",
     "langchain-google-genai",

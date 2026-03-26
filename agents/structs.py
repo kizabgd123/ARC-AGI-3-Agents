@@ -32,7 +32,9 @@ class FrameData(BaseModel):
         """Create a FrameData from an arcengine FrameData."""
         return cls(
             game_id=engine_frame.game_id,
-            frame=[arr.tolist() for arr in engine_frame.frame] if engine_frame.frame else [],
+            frame=[arr.tolist() for arr in engine_frame.frame]
+            if engine_frame.frame
+            else [],
             state=engine_frame.state,
             levels_completed=engine_frame.levels_completed,
             win_levels=engine_frame.win_levels,
@@ -52,11 +54,14 @@ class ActionInput(BaseModel):
 
     @field_validator("reasoning")
     @classmethod
-    def validate_reasoning_json(cls, v: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    def validate_reasoning_json(
+        cls, v: Optional[dict[str, Any]]
+    ) -> Optional[dict[str, Any]]:
         """Validate that reasoning is JSON serializable."""
         if v is not None:
             try:
                 import json
+
                 json.dumps(v)
             except (TypeError, ValueError) as e:
                 raise ValueError(f"reasoning must be JSON serializable: {e}")
@@ -119,10 +124,7 @@ class Scorecard(BaseModel):
     @property
     def won(self) -> int:
         """Count number of games won."""
-        return sum(
-            1 for card in self.cards.values()
-            if card.state == GameState.WIN
-        )
+        return sum(1 for card in self.cards.values() if card.state == GameState.WIN)
 
     @property
     def played(self) -> int:
@@ -134,7 +136,9 @@ class Scorecard(BaseModel):
         """Get total actions across all games."""
         return sum(card.total_actions for card in self.cards.values())
 
-    def get(self, game_id: Optional[str] = None) -> dict[str, Any] | dict[str, dict[str, Any]]:
+    def get(
+        self, game_id: Optional[str] = None
+    ) -> dict[str, Any] | dict[str, dict[str, Any]]:
         """Get cards, optionally filtered by game_id."""
         if game_id:
             card = self.cards.get(game_id)

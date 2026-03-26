@@ -26,12 +26,14 @@ except Exception as e:
 print("\nTesting anonymous...")
 url_anon = f"{base_url}/api/games/anonkey"
 try:
-    resp_anon = requests.get(url_anon, headers={"Accept": "application/json"}, timeout=10)
+    resp_anon = requests.get(
+        url_anon, headers={"Accept": "application/json"}, timeout=10
+    )
     print(f"Anon status: {resp_anon.status_code}")
     if resp_anon.status_code == 200:
         anon_key = resp_anon.json().get("api_key")
         print(f"Got anon key: {anon_key}")
-        
+
         # Test with anon key
         headers_anon = {"X-Api-Key": anon_key, "Accept": "application/json"}
         resp_test = requests.get(url, headers=headers_anon, timeout=10)

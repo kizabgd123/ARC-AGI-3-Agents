@@ -244,8 +244,8 @@ class ParallelSwarm:
 
         results = []
         for i, batch in enumerate(batches):
-            logger.info(f"=== Starting batch {i+1}/{len(batches)} ===")
-            tags = [f"batch_{i+1}_of_{len(batches)}"]
+            logger.info(f"=== Starting batch {i + 1}/{len(batches)} ===")
+            tags = [f"batch_{i + 1}_of_{len(batches)}"]
             result = self.run_single_scorecard(batch, scorecard_tags=tags)
             results.append(result)
             self.results.append(result)
@@ -331,13 +331,17 @@ class ParallelSwarm:
         logger.info(f"Total batches: {total}")
         logger.info(f"Successful: {successful}")
         logger.info(f"Failed: {failed}")
-        logger.info(f"Total duration: {total_duration:.2f}s ({total_duration/60:.2f} min)")
+        logger.info(
+            f"Total duration: {total_duration:.2f}s ({total_duration / 60:.2f} min)"
+        )
 
         for i, result in enumerate(self.results):
             status = "✓" if result.success else "✗"
-            games = ", ".join(f"{a.game_id}({a.agent_name})" for a in result.assignments)
+            games = ", ".join(
+                f"{a.game_id}({a.agent_name})" for a in result.assignments
+            )
             logger.info(
-                f"{status} Batch {i+1}: {games} - {result.duration_seconds:.2f}s"
+                f"{status} Batch {i + 1}: {games} - {result.duration_seconds:.2f}s"
             )
 
         logger.info("=" * 60)
@@ -453,9 +457,7 @@ Examples:
 
     else:
         logger.error(
-            "Must specify either:\n"
-            "  --agent and --games, OR\n"
-            "  --assign (one or more)"
+            "Must specify either:\n  --agent and --games, OR\n  --assign (one or more)"
         )
         sys.exit(1)
 
