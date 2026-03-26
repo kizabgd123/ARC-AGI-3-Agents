@@ -52,3 +52,6 @@ __all__ = [
     "MultiModalLLM",
     "ThinkingReflexionAgent",
 ]
+
+from .master_agent import MasterAgent
+AVAILABLE_AGENTS["master"] = MasterAgent
