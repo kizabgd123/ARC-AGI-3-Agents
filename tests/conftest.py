@@ -3,7 +3,7 @@ import shutil
 
 import pytest
 
-from agents.structs import FrameData, GameState
+from agents.structs import FrameData, GameAction, GameState
 
 
 def get_test_recordings_dir():
@@ -49,6 +49,33 @@ def sample_frame():
         state=GameState.NOT_FINISHED,
         score=5,
     )
+
+
+@pytest.fixture
+def mock_arc_env():
+    """Create a mock arc environment for testing."""
+    from unittest.mock import MagicMock
+    
+    mock_env = MagicMock()
+    mock_env.observation_space = FrameData(
+        game_id="test-game",
+        frame=[[[1, 2], [3, 4]]],
+        state=GameState.NOT_FINISHED,
+        levels_completed=0,
+        available_actions=[GameAction.ACTION1, GameAction.ACTION2, GameAction.RESET],
+    )
+    
+    def mock_step(action, data=None, reasoning=None):
+        return FrameData(
+            game_id="test-game",
+            frame=[[[1, 2], [3, 4]]],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            available_actions=[GameAction.ACTION1, GameAction.ACTION2, GameAction.RESET],
+        )
+    
+    mock_env.step = mock_step
+    return mock_env
 
 
 @pytest.fixture

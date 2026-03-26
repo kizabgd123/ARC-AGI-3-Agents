@@ -181,13 +181,14 @@ class TestScorecard:
 
 @pytest.mark.unit
 class TestRandomAgent:
-    def test_agent_init(self):
+    def test_agent_init(self, mock_arc_env):
         agent = Random(
             card_id="test-card",
             game_id="test-game",
             agent_name="test-agent",
             ROOT_URL="https://example.com",
             record=False,
+            arc_env=mock_arc_env,
         )
 
         assert agent.game_id == "test-game"
@@ -200,13 +201,14 @@ class TestRandomAgent:
         assert "random" in name
         assert "80" in name
 
-    def test_agent_action_logic(self, sample_frame):
+    def test_agent_action_logic(self, sample_frame, mock_arc_env):
         agent = Random(
             card_id="test-card",
             game_id="test-game",
             agent_name="test-agent",
             ROOT_URL="https://example.com",
             record=False,
+            arc_env=mock_arc_env,
         )
 
         sample_frame.state = GameState.NOT_PLAYED
@@ -227,13 +229,14 @@ class TestRandomAgent:
 
 @pytest.mark.unit
 class TestLangGraphRandomAgent:
-    def test_agent_init(self):
+    def test_agent_init(self, mock_arc_env):
         agent = LangGraphRandom(
             card_id="test-card",
             game_id="test-game",
             agent_name="test-agent",
             ROOT_URL="https://example.com",
             record=False,
+            arc_env=mock_arc_env,
         )
 
         assert agent.game_id == "test-game"
@@ -249,13 +252,14 @@ class TestLangGraphRandomAgent:
         assert "langgraphrandom" in name.lower()
         assert "80" in name
 
-    def test_agent_action_logic(self, sample_frame):
+    def test_agent_action_logic(self, sample_frame, mock_arc_env):
         agent = LangGraphRandom(
             card_id="test-card",
             game_id="test-game",
             agent_name="test-agent",
             ROOT_URL="https://example.com",
             record=False,
+            arc_env=mock_arc_env,
         )
 
         # NOT_PLAYED state -> RESET
