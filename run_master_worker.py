@@ -13,10 +13,10 @@ def main():
     print("--- Starting Master/Worker System ---")
     print(f"Master will play game: {args.game}")
     print(f"Using workers: {args.workers}")
-    print("
-NOTE: Ensure worker servers are running separately. You can run a worker with:")
-    print("python -m agents.worker_agent
-")
+    print("""
+NOTE: Ensure worker servers are running separately. You can run a worker with:
+python -m agents.worker_agent
+""")
 
 
     # This is a simplified setup. A real implementation would need to handle
