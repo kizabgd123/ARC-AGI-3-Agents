@@ -34,6 +34,7 @@ If the plan is good, respond with 'APPROVED'. Otherwise, provide specific feedba
 import os
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph import StateGraph, END
 
 def get_model():
     return ChatOpenAI(model="gpt-4o", api_key=os.getenv("OPENAI_API_KEY"))
@@ -63,3 +64,21 @@ def critic(state: AgentState):
     response = model.invoke([SystemMessage(content=prompt)])
     is_approved = "APPROVED" in response.content.upper()
     return {"thinking_history": state["thinking_history"] + [ThinkingHistory(iteration=state["iteration_count"], plan=last_plan, critique=response.content)]}
+
+def should_continue(state: AgentState):
+    if state["iteration_count"] >= 3:
+        return END
+    last_critique = state["thinking_history"][-1].critique if state["thinking_history"] else ""
+    if "APPROVED" in last_critique.upper():
+        return END
+    return "planner"
+
+workflow = StateGraph(AgentState)
+workflow.add_node("planner", planner)
+workflow.add_node("critic", critic)
+
+workflow.set_entry_point("planner")
+workflow.add_edge("planner", "critic")
+workflow.add_conditional_edges("critic", should_continue)
+
+thinking_reflexion_agent = workflow.compile()
